@@ -1,0 +1,6 @@
+datalog\parser\USparkDLEngine.class
+datalog\parser\DatalogMain.class
+datalog\parser\DatalogProgramProvider.class
+datalog\parser\WrapFact.class
+datalog\parser\SimpleProgram.class
+datalog\parser\SimpleProgram$1.class
