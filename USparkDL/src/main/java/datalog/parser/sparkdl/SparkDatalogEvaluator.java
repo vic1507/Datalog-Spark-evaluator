@@ -8,18 +8,13 @@ import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
-import org.apache.spark.graphx.Edge;
-import org.apache.spark.graphx.Graph;
-import org.apache.spark.graphx.GraphOps;
 import org.apache.spark.sql.SparkSession;
-import org.apache.spark.storage.StorageLevel;
 
 import datalog.parser.DatalogProgramProvider;
 import datalog.parser.USparkDLEngine;
 import it.unical.mat.dlv.program.Program;
 import it.unical.mat.dlv.program.Rule;
 import scala.Tuple2;
-import scala.reflect.ClassTag;
 
 public class SparkDatalogEvaluator {
 
@@ -35,27 +30,62 @@ public class SparkDatalogEvaluator {
 
 		JavaSparkContext jsc = new JavaSparkContext(session.sparkContext());
 
-		// Program program1 = new Program();
-		// program1.add(new Rule("a(X) :- b (X)."));
-		// program1.add(new Rule("b(2)."));
-		// program1.add(new Rule("b(3)."));
+		Program program1 = new Program();
+		program1.add(new Rule("a(X, Y) :- b (X, Y)."));
+		program1.add(new Rule("c(X, Y) :- d (X, Y)."));
+		program1.add(new Rule("e (X) :- f (X)."));
+		program1.add(new Rule("g(X) :- f(X)."));
+		program1.add(new Rule("h(X) :- g(X)."));
+		program1.add(new Rule("b(2, 3)."));
+		program1.add(new Rule("b(2, 4)."));
+		program1.add(new Rule("d(2, 5)."));
+		program1.add(new Rule("d(3, 5)."));
+		program1.add(new Rule("f(3)."));
+		program1.add(new Rule("f(5)."));
 
 		Program program2 = new Program();
-		program2.add(new Rule("a(X) :- b(X)."));
-		program2.add(new Rule("a(X):- a(Y), c(Y,X)."));
-		program2.add(new Rule("n(X) :- t(X), not a(X)."));
+		program2.add(new Rule("a(X) :- c(X), not b(X)."));
 		program2.add(new Rule("b(2)."));
-		program2.add(new Rule("b(4)."));
-		program2.add(new Rule("c(2,5)."));
-		program2.add(new Rule("t(3)."));
-		program2.add(new Rule("t(2)."));
+		program2.add(new Rule("b(3)."));
+		program2.add(new Rule("c(2)."));
+		program2.add(new Rule("c(3)."));
+		program2.add(new Rule("c(4)."));
+
+		Program program3 = new Program();
+		program3.add(new Rule("a(X, Y) :- b (X, Y)."));
+		program3.add(new Rule("a(X, Y) :- a(X, Z), b (Z, Y)."));
+		program3.add(new Rule("b(1, 2)."));
+		program3.add(new Rule("b(1, 3)."));
+		program3.add(new Rule("b(2, 4)."));
+		program3.add(new Rule("b(4, 5)."));
 		
+		Program program22 = new Program();
+		program22.add(new Rule("a(X) :- b(X)."));
+		program22.add(new Rule("a(X):- a(Y), c(Y,X)."));
+		program22.add(new Rule("n(X) :- t(X), not a(X)."));
+		program22.add(new Rule("b(2)."));
+		program22.add(new Rule("b(4)."));
+		program22.add(new Rule("c(2,5)."));
+		program22.add(new Rule("t(3)."));
+		program22.add(new Rule("t(2)."));
 
-		// method1(jsc, program1);
-		stratifiedMethod(jsc, program2);
-		// graphX(jsc);
+		System.out.println("start test 1");
+		method1(jsc, program1);
+		System.out.println("end test 1");
 
-		// method1(jsc, program1);
+		System.out.println("start test 2");
+		method1(jsc, program2);
+		System.out.println("end test 2");
+
+		System.out.println("start test 3");
+		stratifiedMethod(jsc, program3);
+		System.out.println("end test 3");
+
+		System.out.println("start test 4");
+		stratifiedMethod(jsc, program22);
+		System.out.println("end test 4");
+
+		jsc.close();
 
 	}
 
@@ -77,7 +107,8 @@ public class SparkDatalogEvaluator {
 			// K : b V : b (1, 2)
 			// K: c V : c (1, 2) ecc
 			JavaPairRDD<String, Rule> parallelizedDelta = parallelizedEdb
-					.mapToPair(rule -> new Tuple2<String, Rule>(rule.getHead().get(0).getName(), rule));
+					.mapToPair(rule -> new Tuple2<String, Rule>(rule.getHead().get(0).getName(), rule))
+					.partitionBy(new HashPartitioner(delta1.size()));
 
 			// K: b V : a (x) :- b(x); c(x) :- b(x) (tutte le regole che dipendono da x)
 			JavaPairRDD<String, Iterable<Rule>> idbStructure = parallelizedIdb.flatMapToPair(rule -> {
@@ -86,60 +117,61 @@ public class SparkDatalogEvaluator {
 					result.add(new Tuple2<String, Rule>(rule.getBody().get(i).getName(), rule));
 				}
 				return result.iterator();
-			}).partitionBy(new HashPartitioner(idb.size())).groupByKey();
+			}).partitionBy(new HashPartitioner(idb.size())).groupByKey().partitionBy(new HashPartitioner(idb.size()));
 
 			// ottengo b : fatto - regole
 			// b: altro fatto - regole ... gruppo per chiave ed ho b ... iterable di fatto,
 			// regole
-			JavaPairRDD<String, Iterable<Tuple2<Rule, Iterable<Rule>>>> catalog = parallelizedDelta
-					.partitionBy(new HashPartitioner(delta1.size())).join(idbStructure).groupByKey();
+			JavaPairRDD<String, Iterable<Tuple2<Rule, Iterable<Rule>>>> catalog = parallelizedDelta.join(idbStructure)
+					.groupByKey();
 
 			// giocata di prestigio. trasformo in modo da avere regola1 --- tutti i fatti
 			// che la interessano, poi uso generate e trovo nuovi fatti
-			JavaRDD<Rule> newDelta = catalog.flatMapToPair(t -> {
+			JavaPairRDD<String, Iterable<Rule>> newDelta2 = catalog.flatMapToPair(t -> {
 
-				List<Tuple2<Rule, Rule>> object = new ArrayList<>();
+				List<Tuple2<String, Rule>> object = new ArrayList<>();
 				for (Tuple2<Rule, Iterable<Rule>> tuple : t._2) {
 					for (Rule r : tuple._2)
-						object.add(new Tuple2<Rule, Rule>(r, tuple._1));
+						object.add(new Tuple2<String, Rule>(r.toString(), tuple._1));
 				}
 				return object.iterator();
-			}).partitionBy(new HashPartitioner(10)).groupByKey().flatMap(t -> {
+			}).partitionBy(new HashPartitioner(10)).groupByKey();
+
+			JavaRDD<Rule> newDelta1 = newDelta2.flatMap(t -> {
 				USparkDLEngine engine = new USparkDLEngine();
-				return engine.generate((Iterable<Rule>) t._2, t._1).iterator();
+				return engine.generate(t._2, new Rule(t._1)).iterator();
 			});
 
-			delta1 = newDelta.collect();
+			// edb.addAll(newDelta1.collect());
+			delta1 = newDelta1.collect();
+
+			// USparkDLEngine engine = new USparkDLEngine();
+			// idb = engine.getDependendRules(idb, delta1);
 		}
 
 		for (Rule r : results)
 			System.out.println(r);
 
-		jsc.close();
+		// jsc.close();
 	}
 
-	
-	
-	public static Tuple2<String,String> getTupleFromString(Rule r)
-	{
-		return null;
-	}
-	
 	public static void stratifiedMethod(JavaSparkContext jsc, Program program1) {
 
+		long startTime = System.nanoTime();
 		DatalogProgramProvider positiveNonStratifiedDatalog = new DatalogProgramProvider(program1);
 		List<Rule> edb = positiveNonStratifiedDatalog.getEDB();
 		List<Rule> delta1 = edb;
 		List<Rule> results = new ArrayList<Rule>();
 		USparkDLEngine masterEngine = new USparkDLEngine();
 		List<List<Rule>> straties = masterEngine.wrapStratification(positiveNonStratifiedDatalog.getIDB());
-		
-		for (List<Rule> stratum : straties) {
+
+		for (int strat = 0; strat < straties.size(); strat++) {
+			List<Rule> rules = straties.get(strat);
 			while (!delta1.isEmpty()) {
 				results.addAll(delta1);
 
 				JavaRDD<Rule> parallelizedEdb = jsc.parallelize(delta1);
-				JavaRDD<Rule> parallelizedStratum = jsc.parallelize(stratum);
+				JavaRDD<Rule> parallelizedStratum = jsc.parallelize(rules);
 
 				// K : b V : b (1, 2)
 				// K: c V : c (1, 2) ecc
@@ -153,7 +185,7 @@ public class SparkDatalogEvaluator {
 						result.add(new Tuple2<String, Rule>(rule.getBody().get(i).getName(), rule));
 					}
 					return result.iterator();
-				}).partitionBy(new HashPartitioner(stratum.size())).groupByKey();
+				}).partitionBy(new HashPartitioner(straties.get(strat).size())).groupByKey();
 
 				// ottengo b : fatto - regole
 				// b: altro fatto - regole ... gruppo per chiave ed ho b ... iterable di fatto,
@@ -165,25 +197,32 @@ public class SparkDatalogEvaluator {
 				// che la interessano, poi uso generate e trovo nuovi fatti
 				JavaRDD<Rule> newDelta = catalog.flatMapToPair(t -> {
 
-					List<Tuple2<Rule, Rule>> object = new ArrayList<>();
+					List<Tuple2<String, Rule>> object = new ArrayList<>();
 					for (Tuple2<Rule, Iterable<Rule>> tuple : t._2) {
 						for (Rule r : tuple._2)
-							object.add(new Tuple2<Rule, Rule>(r, tuple._1));
+							object.add(new Tuple2<String, Rule>(r.toString(), tuple._1));
 					}
 					return object.iterator();
-				}).partitionBy(new HashPartitioner(10)).groupByKey().flatMap(t -> {
+				}).groupByKey().flatMap(t -> {
 					USparkDLEngine nodeEngine = new USparkDLEngine();
-					return nodeEngine.generate((Iterable<Rule>) t._2, t._1).iterator();
+					return nodeEngine.generate(t._2, new Rule(t._1)).iterator();
 				});
 
 				delta1 = newDelta.collect();
+				
+				//rules = masterEngine.getDependendRules(straties.get(strat), delta1);
 			}
-			
-		}
-		
-		results.stream().distinct().forEach(System.out::println);
 
-		jsc.close();
+			delta1 = results;
+
+		}
+
+		long end1 = System.nanoTime();
+		results.stream().distinct().forEach(System.out::println);
+		long end = System.nanoTime();
+		System.out.println(end1 - startTime);
+		System.out.println(end - startTime);
+		// jsc.close();
 	}
 
 }
